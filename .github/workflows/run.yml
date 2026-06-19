@@ -61,10 +61,12 @@ jobs:
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v2
 
-      - name: Pull models
+      - name: Pull novel hybrid models
         run: |
-          ollama pull llama3.2:1b
-          ollama pull nomic-embed-text
+          ollama pull smollm2:135m
+          ollama pull gemma3:1b
+          ollama pull jamba:3b
+          ollama pull nomic-embed-text  
 
       - name: Start API server + Cloudflare tunnel
         run: |
@@ -130,4 +132,5 @@ jobs:
           fi
 
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
+
           sleep infinity
