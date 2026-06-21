@@ -1,24 +1,25 @@
-name: Server (24/7 via Cron Overlap)
+name: Self‑Replicating Server (24/7)
 
 on:
-  workflow_dispatch:          # manual trigger for testing
-  schedule:
-    - cron: '*/2 * * * *'     # every 5 hours at minute 0
+  workflow_dispatch:   # manual start – no schedule
 
 permissions:
-  contents: read              # no write permissions needed (we don't commit anything)
+  actions: write       # required for GITHUB_TOKEN to trigger a new run
+  contents: read       # default; not strictly needed
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360      # 6 hours – ensures overlap
+    timeout-minutes: 360
 
     steps:
-      # --- 1. Check out the runner repo ---
+      # --- Check out the runner repo (this repo) ---
+      # Uses the default GITHUB_TOKEN (automatically provided)
       - name: Checkout runner repo
         uses: actions/checkout@v4
 
-      # --- 2. Check out the backend repo into ./backend ---
+      # --- Check out the backend repo into ./backend ---
+      # Uses your PAT (TOKEN) because it's a different repository
       - name: Checkout backend repo
         uses: actions/checkout@v4
         with:
@@ -39,7 +40,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ollama/models
-          key: ollama-models-${{ hashFiles('.github/workflows/server-cron.yml') }}
+          key: ollama-models-${{ hashFiles('.github/workflows/self-replicating.yml') }}
           restore-keys: ollama-models-
 
       - name: Cache cloudflared
@@ -73,10 +74,10 @@ jobs:
           ollama pull gemma3:1b
           ollama pull qwen3-embedding:0.6b
 
-      # --- Start server, tunnel, update config, and keep alive ---
-      - name: Start services and keep alive
+      # --- Main service + self‑replication ---
+      - name: Start server, tunnel, and replicate
         env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
+          GH_TOKEN: ${{ secrets.TOKEN }}   # used for GitHub API calls to update config
         run: |
           set -e
 
@@ -113,7 +114,7 @@ jobs:
           done
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # Update config.js in chat repo
+          # Update config.js in chat repo (uses TOKEN)
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG="const API_URL = \"${TUNNEL_URL}\";"
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -138,8 +139,35 @@ jobs:
           fi
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # --- Keep the runner alive until the next scheduled run takes over ---
-          # The next run will start in ~5 hours; this one will be killed at 6 hours.
-          # We just sleep infinitely – the timeout will handle termination.
-          echo "Service is running. Next scheduled run will take over."
-          sleep infinity
+          # --- Self‑replication loop ---
+          START_TIME=$(date +%s)
+          TRIGGER_AT=$(( 350 * 60 ))   # 5 minutes before 6h timeout
+          TRIGGERED=false
+
+          while true; do
+            ELAPSED=$(( $(date +%s) - START_TIME ))
+
+            # Trigger new run at the right time (only once)
+            if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
+              echo "Triggering replacement workflow..."
+              curl -X POST \
+                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow_id }}/dispatches" \
+                -d '{"ref":"${{ github.ref }}"}'
+              TRIGGERED=true
+            fi
+
+            # Health checks
+            if ! curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
+              echo "Server down – restarting..."
+              pkill -f unified-api 2>/dev/null || true
+              ./unified-api &
+            fi
+            if ! pgrep -f cloudflared > /dev/null; then
+              echo "Tunnel down – restarting..."
+              ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee -a tunnel.log &
+            fi
+
+            sleep 30
+          done
