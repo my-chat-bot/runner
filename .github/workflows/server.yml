@@ -64,7 +64,7 @@ jobs:
       # --- Ollama ---
       - uses: ai-action/setup-ollama@v2
       - run: |
-          ollama pull gemma3:1b  
+          ollama pull ibm/granite4:3b-h  
           ollama pull qwen3-embedding:0.6b
 
       - name: Save ollama
