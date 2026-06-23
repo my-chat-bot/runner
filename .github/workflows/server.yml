@@ -4,127 +4,105 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write   
+  actions: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   
+    timeout-minutes: 360
 
     steps:
-      # --------------------------------------------------------------------
-      # 1. Check out the backend repository
+      # --- Checkout backend ---
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/backend
           token: ${{ secrets.TOKEN }}
           path: backend
 
-      # --------------------------------------------------------------------
-      # 2. Restore caches (if they exist from previous runs)
+      # --- Restore caches ---
       - uses: actions/cache@v4
-        id: binary-cache
+        id: binary
         with:
           path: backend/target/release/unified-api
           key: rust-binary-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}
           restore-keys: rust-binary-${{ runner.os }}-
 
       - uses: actions/cache@v4
-        id: ollama-cache
+        id: ollama
         with:
           path: ~/.ollama/models
-          key: ollama-models-${{ hashFiles('.github/workflows/server.yml') }}
-          restore-keys: ollama-models-
+          key: ollama-${{ hashFiles('.github/workflows/server.yml') }}
+          restore-keys: ollama-
 
       - uses: actions/cache@v4
-        id: cloudflared-cache
+        id: cloudflared
         with:
           path: ./cloudflared
-          key: cloudflared-${{ runner.os }}-v1
+          key: cloudflared-${{ runner.os }}
 
-      # --------------------------------------------------------------------
-      # 3. Set up Rust and build (only on cache miss)
+      # --- Rust setup + build (if cache miss) ---
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
           toolchain: stable
           override: true
 
-      - name: Build Rust binary (if cache miss)
-        if: steps.binary-cache.outputs.cache-hit != 'true'
+      - name: Build binary
+        if: steps.binary.outputs.cache-hit != 'true'
         run: |
           cd backend
           cargo build --release
           cp target/release/unified-api ./
 
-      # --------------------------------------------------------------------
-      # 4. Save binary cache (only if we built it)
-      - name: Save binary cache
-        if: steps.binary-cache.outputs.cache-hit != 'true'
+      - name: Save binary
+        if: steps.binary.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: backend/target/release/unified-api
           key: rust-binary-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}
 
-      # --------------------------------------------------------------------
-      # 5. Pull Ollama models (cached after first run)
+      # --- Ollama ---
       - uses: ai-action/setup-ollama@v2
-      - name: Pull Ollama models
-        run: |
-          ollama pull gemma3:1b
+      - run: |
+          ollama pull gemma3:1b 
           ollama pull qwen3-embedding:0.6b
 
-      # --------------------------------------------------------------------
-      # 6. Save Ollama cache (always – it will skip if key already exists)
-      - name: Save Ollama cache
+      - name: Save ollama
         uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ollama-models-${{ hashFiles('.github/workflows/server.yml') }}
+          key: ollama-${{ hashFiles('.github/workflows/server.yml') }}
 
-      # --------------------------------------------------------------------
-      # 7. Download cloudflared (if not cached)
+      # --- Cloudflared ---
       - name: Download cloudflared
-        if: steps.cloudflared-cache.outputs.cache-hit != 'true'
+        if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
-          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # --------------------------------------------------------------------
-      # 8. Save cloudflared cache (only if we downloaded it)
-      - name: Save cloudflared cache
-        if: steps.cloudflared-cache.outputs.cache-hit != 'true'
+      - name: Save cloudflared
+        if: steps.cloudflared.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ./cloudflared
-          key: cloudflared-${{ runner.os }}-v1
+          key: cloudflared-${{ runner.os }}
 
-      # --------------------------------------------------------------------
-      # 9. Start the server, create tunnel, update config, and self‑replicate
-      #    This step runs forever – the caches were already saved above.
-      - name: Run server & self‑replicate
+      # --- Main service (starts server, tunnel, config update, and self‑replicates) ---
+      - name: Run & replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
           cd backend
 
-          # Start the server
+          # Start server
           chmod +x ./unified-api
           pkill -f unified-api 2>/dev/null || true
           ./unified-api &
+          sleep 5
 
-          # Wait for health
-          for i in {1..10}; do
-            if curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
-              break
-            fi
-            sleep 2
-          done
-          curl -s http://localhost:8000/health | grep -q '"status":"ok"' || exit 1
-
-          # Start Cloudflare tunnel
+          # Start tunnel
           if [ ! -f ../cloudflared ]; then
-            curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ../cloudflared
+            curl -Lo ../cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x ../cloudflared
           fi
           pkill -f cloudflared 2>/dev/null || true
@@ -138,7 +116,7 @@ jobs:
           done
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # Update config.js in the chat repository
+          # Update config.js
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG="const API_URL = \"${TUNNEL_URL}\";"
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -163,16 +141,16 @@ jobs:
           fi
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # Self‑replication: trigger a new run ~5 minutes before timeout
+          # Self‑replication loop
           START_TIME=$(date +%s)
-          TRIGGER_AT=$(( 350 * 60 ))   # 5 hours 50 minutes
+          TRIGGER_AT=$(( 350 * 60 ))
           TRIGGERED=false
 
           while true; do
             ELAPSED=$(( $(date +%s) - START_TIME ))
 
             if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
-              echo "Triggering replacement workflow..."
+              echo "Triggering replacement..."
               curl -X POST \
                 -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
                 -H "Accept: application/vnd.github.v3+json" \
@@ -181,7 +159,7 @@ jobs:
               TRIGGERED=true
             fi
 
-            # Health checks – restart if needed
+            # Health checks
             if ! curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
               echo "Server down – restarting..."
               pkill -f unified-api 2>/dev/null || true
