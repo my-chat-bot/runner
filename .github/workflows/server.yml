@@ -21,7 +21,7 @@ jobs:
       - uses: actions/cache@v4
         id: binary
         with:
-          path: backend/target/release/unified-api
+          path: backend/target/release/backend
           key: rust-binary-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}
           restore-keys: rust-binary-${{ runner.os }}-
 
@@ -51,14 +51,14 @@ jobs:
 
       - name: Prepare binary
         run: |
-          cp backend/target/release/unified-api backend/unified-api
-          chmod +x backend/unified-api
+          cp backend/target/release/backend backend/backend
+          chmod +x backend/backend
           rm -rf backend/target
 
       - if: steps.binary.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: backend/target/release/unified-api
+          path: backend/target/release/backend
           key: rust-binary-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}
 
       - uses: ai-action/setup-ollama@v2
@@ -87,7 +87,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
           cd backend
-          ./unified-api &
+          ./backend &
           for i in {1..10}; do
             curl -s http://localhost:8000/health | grep -q '"status":"ok"' && break
             sleep 2
@@ -141,8 +141,8 @@ jobs:
               TRIGGERED=true
             fi
             if ! curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
-              pkill -f unified-api 2>/dev/null || true
-              ./unified-api &
+              pkill -f backend 2>/dev/null || true
+              ./backend &
             fi
             if ! pgrep -f cloudflared > /dev/null; then
               ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee -a tunnel.log &
