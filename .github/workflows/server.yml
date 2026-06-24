@@ -29,14 +29,14 @@ jobs:
         id: ollama
         with:
           path: ~/.ollama/models
-          key: ollama-granite4-v1
+          key: ollama-granite4
           restore-keys: ollama-
 
       - uses: actions/cache@v4
         id: cloudflared
         with:
           path: ./cloudflared
-          key: cloudflared-${{ runner.os }}-v1
+          key: cloudflared-${{ runner.os }}
 
       - uses: actions-rs/toolchain@v1
         with:
