@@ -106,40 +106,49 @@ jobs:
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
+          
           FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
           SHA=$(echo "$FILE_INFO" | jq -r '.sha')
 
           if [ "$SHA" != "null" ]; then
-            MESSAGE="update API URL"
+            curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+              -d "{
+                \"message\":\"update API URL\",
+                \"content\":\"${ENCODED}\",
+                \"sha\":\"${SHA}\",
+                \"author\":{
+                  \"name\":\"github-actions[bot]\",
+                  \"email\":\"github-actions[bot]@users.noreply.github.com\"
+                },
+                \"committer\":{
+                  \"name\":\"github-actions[bot]\",
+                  \"email\":\"github-actions[bot]@users.noreply.github.com\"
+                }
+              }"
           else
-            MESSAGE="add API URL"
+            curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+              -d "{
+                \"message\":\"add API URL\",
+                \"content\":\"${ENCODED}\",
+                \"author\":{
+                  \"name\":\"github-actions[bot]\",
+                  \"email\":\"github-actions[bot]@users.noreply.github.com\"
+                },
+                \"committer\":{
+                  \"name\":\"github-actions[bot]\",
+                  \"email\":\"github-actions[bot]@users.noreply.github.com\"
+                }
+              }"
           fi
-
-          PAYLOAD=$(jq -n \
-            --arg message "$MESSAGE" \
-            --arg content "$ENCODED" \
-            --arg sha "$SHA" \
-            --arg authorName "github-actions[bot]" \
-            --arg authorEmail "github-actions[bot]@users.noreply.github.com" \
-            '{
-              message: $message,
-              content: $content,
-              (if $sha != "null" then {sha: $sha} else {} end) +
-              {
-                author: {name: $authorName, email: $authorEmail},
-                committer: {name: $authorName, email: $authorEmail}
-              }
-            }')
-
-          curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-            -d "$PAYLOAD"
-
+          
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
-
+          
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
           TRIGGERED=false
