@@ -28,7 +28,7 @@ jobs:
           key: cloudflared
           restore-keys: cloudflared-
 
-      # --- Setup Ollama ---
+      # --- Setup Ollama (only if cache miss) ---
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: ai-action/setup-ollama@v2
 
@@ -56,43 +56,75 @@ jobs:
           path: ./cloudflared
           key: cloudflared
 
-      # --- Run Ollama Server, Tunnel, and Self‑Replicate ---
+      # --- Run Ollama, Tunnel, and Self‑Replicate ---
       - name: Run and Replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
+          # 🔑 KEY FIX: Bind Ollama to all interfaces
+          OLLAMA_HOST: 0.0.0.0:11434
         run: |
-          # 1. Start Ollama server
+          set -e
+
+          echo "🚀 Starting Ollama server..."
           ollama serve &
 
-          # 2. Wait for Ollama to be ready
-          for i in {1..10}; do
-            if curl -s http://localhost:11434/api/tags > /dev/null; then
+          # Wait for Ollama to be ready (with timeout)
+          echo "⏳ Waiting for Ollama to be ready..."
+          for i in {1..20}; do
+            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+              echo "✅ Ollama is ready"
               break
             fi
+            echo "⏳ Attempt $i/20 - Ollama not ready yet..."
             sleep 2
           done
-          curl -s http://localhost:11434/api/tags > /dev/null || exit 1
 
-          # 3. Ensure model is pulled (idempotent – does nothing if already present)
+          # Verify Ollama is running
+          if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+            echo "❌ Ollama failed to start after 40 seconds"
+            echo "📋 Checking ollama processes..."
+            ps aux | grep ollama || true
+            exit 1
+          fi
+
+          # Ensure model is pulled (idempotent – does nothing if already present)
+          echo "📦 Pulling model..."
           ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
 
-          # 4. Start Cloudflare tunnel (pointing to Ollama's port 11434)
+          # Start Cloudflare tunnel (pointing to Ollama's port 11434)
+          echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
+
           pkill -f cloudflared 2>/dev/null || true
           ./cloudflared tunnel --protocol http2 --url http://localhost:11434 2>&1 | tee tunnel.log &
 
-          # 5. Extract tunnel URL
+          # Extract tunnel URL
+          echo "⏳ Waiting for tunnel URL..."
+          TUNNEL_URL=""
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            [ -n "$TUNNEL_URL" ] && break
-            sleep 1
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Tunnel URL: ${TUNNEL_URL}"
+              break
+            fi
+            echo "⏳ Attempt $i/30 - waiting for tunnel..."
+            sleep 2
           done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL after 60 seconds"
+            echo "📋 Last 20 lines of tunnel.log:"
+            tail -20 tunnel.log
+            exit 1
+          fi
+
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # 6. Update config.json in the chat repo (so frontend redirects to the tunnel)
+          # Update config.json in the chat repo
+          echo "📝 Updating config.json..."
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -126,7 +158,8 @@ jobs:
 
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # 7. Self‑replication loop (trigger new run ~5 minutes before timeout)
+          # Self‑replication loop
+          echo "🔄 Entering self‑replication loop..."
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
           TRIGGERED=false
@@ -135,7 +168,7 @@ jobs:
             ELAPSED=$(( $(date +%s) - START_TIME ))
 
             if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
-              echo "Triggering replacement workflow..."
+              echo "⏰ Triggering replacement workflow..."
               curl -X POST -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
                 -H "Accept: application/vnd.github.v3+json" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/workflows/server.yml/dispatches" \
@@ -144,14 +177,15 @@ jobs:
             fi
 
             # Health checks – restart if needed
-            if ! curl -s http://localhost:11434/api/tags > /dev/null; then
-              echo "Ollama server down – restarting..."
+            if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+              echo "⚠️ Ollama server down – restarting..."
               pkill -f ollama 2>/dev/null || true
               ollama serve &
+              sleep 5
             fi
 
             if ! pgrep -f cloudflared > /dev/null; then
-              echo "Tunnel down – restarting..."
+              echo "⚠️ Tunnel down – restarting..."
               ./cloudflared tunnel --protocol http2 --url http://localhost:11434 2>&1 | tee -a tunnel.log &
             fi
 
