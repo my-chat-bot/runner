@@ -12,44 +12,64 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ----- 1. Check disk space (optional) -----
-      - name: Check disk space
-        run: df -h /
+      # ----- Caching: Ollama Models -----
+      - uses: actions/cache@v4
+        id: ollama
+        with:
+          path: ~/.ollama/models
+          key: ollama-distilled-tiny
+          restore-keys: ollama-
 
-      # ----- 2. Setup Ollama -----
-      - uses: ai-action/setup-ollama@v2
+      # ----- Caching: Cloudflared -----
+      - uses: actions/cache@v4
+        id: cloudflared
+        with:
+          path: ./cloudflared
+          key: cloudflared
+          restore-keys: cloudflared-
 
-      # ----- 3. Download Q4_K_M model (every time) -----
-      - name: Download model
+      # ----- Setup Ollama (only on cache miss) -----
+      - if: steps.ollama.outputs.cache-hit != 'true'
+        uses: ai-action/setup-ollama@v2
+
+      # ----- Pull the custom model (only on cache miss) -----
+      - if: steps.ollama.outputs.cache-hit != 'true'
         run: ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
 
-      # ----- 4. Download Cloudflared (every time) -----
-      - name: Download cloudflared
+      # ----- Save Ollama cache (only on cache miss) -----
+      - if: steps.ollama.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-distilled-tiny
+
+      # ----- Download Cloudflared (only on cache miss) -----
+      - if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ----- 5. Run Server, Tunnel, Config Update, Self‑Replicate (with Ollama optimisations) -----
+      # ----- Save Cloudflared cache (only on cache miss) -----
+      - if: steps.cloudflared.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ./cloudflared
+          key: cloudflared
+
+      # ----- Main: Run Ollama, Open WebUI, Tunnel, Update Config, Self‑Replicate -----
       - name: Run and Replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
-          # Ollama optimisations
           OLLAMA_HOST: 0.0.0.0:11434
-          OLLAMA_NUM_PARALLEL: 2
-          OLLAMA_MAX_LOADED_MODELS: 1
-          OLLAMA_KEEP_ALIVE: 10m
-          OLLAMA_CONTEXT_LENGTH: 4096
-          OLLAMA_FLASH_ATTENTION: true
-          OLLAMA_SCHED_SPREAD: true
         run: |
           set -e
 
-          echo "🚀 Starting Ollama server with optimised settings..."
+          echo "🚀 Starting Ollama server..."
           pkill -f ollama 2>/dev/null || true
           ollama serve &
 
-          # Wait for Ollama
-          echo "⏳ Waiting for Ollama..."
+          # Wait for Ollama to become ready
+          echo "⏳ Waiting for Ollama to be ready..."
           for i in {1..20}; do
             if curl -s http://localhost:11434/api/tags > /dev/null; then
               echo "✅ Ollama is ready"
@@ -61,44 +81,53 @@ jobs:
 
           if ! curl -s http://localhost:11434/api/tags > /dev/null; then
             echo "❌ Ollama failed to start"
+            ps aux | grep ollama || true
             exit 1
           fi
 
-          # ----- Start Open WebUI (with --network=host, listens on 8080) -----
-          echo "🐳 Starting Open WebUI..."
-          docker rm -f open-webui 2>/dev/null || true
-          docker run -d \
-            --name open-webui \
-            --network host \
-            -e OLLAMA_BASE_URL=http://localhost:11434 \
-            -v open-webui-data:/app/backend/data \
-            ghcr.io/open-webui/open-webui:main
+          echo "📦 Pulling model..."
+          ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
 
-          # Wait for Open WebUI – now checking port 8080
+          # ----- Install Open WebUI (Python) -----
+          echo "🐍 Installing Open WebUI..."
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-pip python3-venv
+
+          # Create a virtual environment
+          python3 -m venv openwebui-env
+          source openwebui-env/bin/activate
+
+          # Install open-webui
+          pip install --quiet open-webui
+
+          # Start Open WebUI (bind to all interfaces, port 3000)
+          echo "🌐 Starting Open WebUI on port 3000..."
+          open-webui serve --host 0.0.0.0 --port 3000 &
+
+          # Wait for Open WebUI to be ready
           echo "⏳ Waiting for Open WebUI..."
-          for i in {1..30}; do
-            if curl -s http://localhost:8080 > /dev/null; then
+          for i in {1..10}; do
+            if curl -s http://localhost:3000 > /dev/null; then
               echo "✅ Open WebUI is ready"
               break
             fi
-            echo "⏳ Attempt $i/30 ..."
+            echo "⏳ Attempt $i/10 ..."
             sleep 2
           done
 
-          if ! curl -s http://localhost:8080 > /dev/null; then
-            echo "❌ Open WebUI failed to start after 60 seconds"
-            docker logs open-webui --tail 20
+          if ! curl -s http://localhost:3000 > /dev/null; then
+            echo "❌ Open WebUI failed to start"
             exit 1
           fi
 
-          # ----- Start Cloudflare tunnel (pointing to port 8080) -----
+          # ----- Start Cloudflare tunnel (pointing to Open WebUI on port 3000) -----
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
           pkill -f cloudflared 2>/dev/null || true
-          ./cloudflared tunnel --protocol http2 --url http://localhost:8080 2>&1 | tee tunnel.log &
+          ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
 
           # Extract tunnel URL
           echo "⏳ Waiting for tunnel URL..."
@@ -184,16 +213,14 @@ jobs:
 
             if ! pgrep -f cloudflared > /dev/null; then
               echo "⚠️ Tunnel down – restarting..."
-              ./cloudflared tunnel --protocol http2 --url http://localhost:8080 2>&1 | tee -a tunnel.log &
+              ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee -a tunnel.log &
             fi
 
-            if ! curl -s http://localhost:8080 > /dev/null; then
-              echo "⚠️ Open WebUI down – restarting container..."
-              docker rm -f open-webui 2>/dev/null || true
-              docker run -d --name open-webui --network host \
-                -e OLLAMA_BASE_URL=http://localhost:11434 \
-                -v open-webui-data:/app/backend/data \
-                ghcr.io/open-webui/open-webui:main
+            if ! curl -s http://localhost:3000 > /dev/null; then
+              echo "⚠️ Open WebUI down – restarting..."
+              pkill -f open-webui 2>/dev/null || true
+              source openwebui-env/bin/activate
+              open-webui serve --host 0.0.0.0 --port 3000 &
               sleep 5
             fi
 
