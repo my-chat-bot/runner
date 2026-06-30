@@ -1,4 +1,4 @@
-name: P2P Exo Inference Mesh (Star Topology)
+name: P2P Inference Swarm (Request-Routing)
 
 on:
   workflow_dispatch:
@@ -8,9 +8,8 @@ permissions:
   contents: write
 
 env:
-  EXO_MODEL: "llama-3.2-1b"
-  EXO_API_PORT: 8000
-  EXO_PEER_PORT: 50052
+  # Known-good small model. Once this works, swap in your Granite GGUF.
+  MODEL_URL: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
 
 jobs:
 
@@ -49,49 +48,62 @@ jobs:
         instance: [1, 2, 3, 4, 5]
 
     steps:
-      - name: Install system dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential git python3 python3-pip python3-venv nodejs npm openssl psmisc netcat-traditional
+          sudo apt-get install -y jq curl build-essential cmake git nodejs npm openssl psmisc netcat-traditional
 
       - name: Install Holesail
         run: sudo npm install -g holesail
 
-      - name: Install Exo
+      - name: Build llama-server
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install exo --quiet
-          echo "---- Exo help ----"
-          exo -h 2>&1 | head -80 || true
-          exo --help 2>&1 | head -80 || true
+          set -e
+          curl -Lo llama.cpp.zip "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9850.zip"
+          unzip -q llama.cpp.zip
+          cd llama.cpp-b9850
+          mkdir -p build && cd build
+          cmake .. -DGGML_RPC=OFF -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target llama-server
+          cp bin/llama-server ../../
+          cd ../..
 
-      - name: Start Exo node and Holesail server
+      - name: Download model
+        run: |
+          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
+          [ "$(head -c 4 model.gguf)" = "GGUF" ] || { echo "❌ Invalid GGUF"; exit 1; }
+
+      - name: Start llama-server and Holesail server
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           set -e
-          PORT=${EXO_PEER_PORT}
+          PORT=50052
           mkdir -p logs
 
-          echo "🐝 Worker $INSTANCE_ID starting Exo node..."
-          nohup exo \
-            --host 0.0.0.0 \
+          echo "🐝 Worker $INSTANCE_ID starting llama-server..."
+          nohup ./llama-server \
+            -m model.gguf \
             --port ${PORT} \
-            > logs/exo.log 2>&1 &
+            --host 127.0.0.1 \
+            -c 2048 \
+            -np 2 \
+            --timeout 120 \
+            > logs/llama.log 2>&1 &
 
-          for i in $(seq 1 40); do
-            if nc -z 127.0.0.1 ${PORT}; then
-              echo "✅ Exo node listening on ${PORT}"
+          for i in $(seq 1 30); do
+            if curl -fs --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+              echo "✅ llama-server healthy on port ${PORT}"
               break
             fi
-            if ! pgrep -f "exo" >/dev/null; then
-              echo "❌ Exo process died"
-              cat logs/exo.log
+            if ! pgrep -f "llama-server" >/dev/null; then
+              echo "❌ llama-server died"
+              cat logs/llama.log
               exit 1
             fi
-            sleep 2
+            sleep 1
           done
 
           echo "🔗 Starting Holesail server on port ${PORT}..."
@@ -158,12 +170,16 @@ jobs:
           while true; do
             sleep 30
 
-            if ! pgrep -f "exo" >/dev/null; then
-              echo "⚠️ Exo process died — restarting..."
-              nohup exo \
-                --host 0.0.0.0 \
+            if ! pgrep -f "llama-server" >/dev/null; then
+              echo "⚠️ llama-server died — restarting..."
+              nohup ./llama-server \
+                -m model.gguf \
                 --port ${PORT} \
-                > logs/exo.log 2>&1 &
+                --host 127.0.0.1 \
+                -c 2048 \
+                -np 2 \
+                --timeout 120 \
+                > logs/llama.log 2>&1 &
               sleep 5
             fi
 
@@ -187,21 +203,30 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install system dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential git python3 python3-pip nodejs npm openssl netcat-traditional
+          sudo apt-get install -y jq curl build-essential cmake git nodejs npm nginx netcat-traditional
 
       - name: Install Holesail
         run: sudo npm install -g holesail
 
-      - name: Install Exo
+      - name: Build llama-server
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install exo --quiet
-          echo "---- Exo help ----"
-          exo -h 2>&1 | head -80 || true
-          exo --help 2>&1 | head -80 || true
+          set -e
+          curl -Lo llama.cpp.zip "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9850.zip"
+          unzip -q llama.cpp.zip
+          cd llama.cpp-b9850
+          mkdir -p build && cd build
+          cmake .. -DGGML_RPC=OFF -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target llama-server
+          cp bin/llama-server ../../
+          cd ../..
+
+      - name: Download model
+        run: |
+          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
+          [ "$(head -c 4 model.gguf)" = "GGUF" ] || { echo "❌ Invalid GGUF"; exit 1; }
 
       - name: Wait for workers and collect Holesail URLs
         env:
@@ -214,18 +239,13 @@ jobs:
             RESPONSE=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null || true)
-
             FILES=$(echo "$RESPONSE" | jq -r '.[]? | select(.type=="file" and (.name | startswith("hole"))) | .name' 2>/dev/null || true)
             COUNT=$(echo "$FILES" | grep -c . || echo 0)
             echo "  Attempt $attempt: $COUNT / ${EXPECTED} workers"
             [ "$COUNT" -ge "${EXPECTED}" ] && break
             sleep 5
           done
-
-          [ "$COUNT" -ge "${EXPECTED}" ] || {
-            echo "❌ Timeout waiting for workers"
-            exit 1
-          }
+          [ "$COUNT" -ge "${EXPECTED}" ] || { echo "❌ Timeout waiting for workers"; exit 1; }
 
           URLS=""
           for f in $FILES; do
@@ -236,23 +256,19 @@ jobs:
             [ -n "$U" ] && [ "$U" != "null" ] || continue
             [ -z "$URLS" ] && URLS="$U" || URLS="$URLS,$U"
           done
-
-          [ -n "$URLS" ] || {
-            echo "❌ No valid worker URLs found"
-            exit 1
-          }
-
+          [ -n "$URLS" ] || { echo "❌ No valid worker URLs"; exit 1; }
           echo "HOLESAIL_URLS=$URLS" >> $GITHUB_ENV
 
-      - name: Open Holesail clients to workers
+      - name: Open Holesail clients and configure Nginx
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
           set -e
           mkdir -p logs
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
+
           BASE=60000
-          PEERS=""
+          UPSTREAM=""
           i=0
           for url in "${URLS[@]}"; do
             port=$((BASE + i))
@@ -270,66 +286,70 @@ jobs:
               exit 1
             fi
 
-            [ -z "$PEERS" ] && PEERS="127.0.0.1:$port" || PEERS="$PEERS,127.0.0.1:$port"
+            # Also ensure the upstream llama-server responds through the tunnel.
+            for t in $(seq 1 30); do
+              if curl -fs --max-time 3 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
+                echo "  ✅ llama-server reachable via port $port"
+                break
+              fi
+              sleep 1
+            done
+
+            UPSTREAM="${UPSTREAM}    server 127.0.0.1:$port max_fails=2 fail_timeout=15s;\n"
             i=$((i + 1))
           done
 
-          echo "EXO_PEERS=$PEERS" >> $GITHUB_ENV
-          echo "✅ Exo worker peers: $PEERS"
-          sleep 8
-
-      - name: Start Exo queen node and Cloudflare tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          EXO_PEERS: ${{ env.EXO_PEERS }}
-        run: |
-          set -e
-          API_PORT=${EXO_API_PORT}
-          PEER_PORT=$((${EXO_PEER_PORT} + 1000))
-
-          echo "👑 Starting Exo queen node..."
-          echo "   Peers: ${EXO_PEERS}"
-
-          mkdir -p logs
-          nohup exo \
-            --host 0.0.0.0 \
-            --port ${PEER_PORT} \
-            --peers "${EXO_PEERS}" \
-            > logs/exo.log 2>&1 &
-
-          EXO_PID=$!
-          echo "Exo PID: $EXO_PID"
-
-          echo "⏳ Waiting for Exo web API on port ${API_PORT}..."
-          for i in $(seq 1 60); do
-            if curl -fs --max-time 3 "http://127.0.0.1:${API_PORT}/v1/models" >/dev/null 2>&1; then
-              echo "✅ Exo web API is up"
-              break
-            fi
-
-            if ! kill -0 $EXO_PID 2>/dev/null; then
-              echo "❌ Exo queen exited early"
-              cat logs/exo.log
-              exit 1
-            fi
-
-            echo "  ($i/60) Waiting..."
-            sleep 5
-          done
-
-          curl -fs --max-time 3 "http://127.0.0.1:${API_PORT}/v1/models" >/dev/null 2>&1 || {
-            echo "❌ Exo API did not become healthy"
-            cat logs/exo.log
-            exit 1
+          echo "🚀 Configuring Nginx..."
+          sudo tee /etc/nginx/sites-available/default > /dev/null <<EOF
+          upstream llama_swarm {
+              least_conn;
+          ${UPSTREAM}
           }
 
-          echo "🌐 Starting Cloudflare tunnel..."
+          server {
+              listen 8080 default_server;
+              access_log /var/log/nginx/queen_access.log;
+              error_log /var/log/nginx/queen_error.log;
+
+              proxy_connect_timeout 10s;
+              proxy_send_timeout 120s;
+              proxy_read_timeout 120s;
+
+              location / {
+                  proxy_pass http://llama_swarm;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_buffering off;
+              }
+          }
+          EOF
+
+          sudo nginx -t
+          sudo systemctl restart nginx || sudo nginx -s reload || sudo service nginx restart
+          echo "✅ Nginx listening on port 8080"
+
+          # Wait for Nginx to pass requests through.
+          for i in $(seq 1 20); do
+            if curl -fs --max-time 3 http://localhost:8080/health >/dev/null 2>&1; then
+              echo "✅ Nginx health check passed"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Start Cloudflare tunnel
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          set -e
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
 
-          nohup ./cloudflared tunnel --protocol http2 --url "http://127.0.0.1:${API_PORT}" > logs/tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > logs/tunnel.log 2>&1 &
 
           TUNNEL_URL=""
           for i in $(seq 1 30); do
@@ -363,14 +383,14 @@ jobs:
               "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" -d "$PAYLOAD"
           fi
 
-          while kill -0 $EXO_PID 2>/dev/null; do
-            if ! curl -fs --max-time 5 "http://127.0.0.1:${API_PORT}/v1/models" >/dev/null 2>&1; then
-              echo "⚠️ Exo API health check failed"
-              tail -80 logs/exo.log
+      - name: Keep alive and monitor
+        run: |
+          while pgrep -x nginx >/dev/null; do
+            if ! curl -fs --max-time 5 http://localhost:8080/health >/dev/null 2>&1; then
+              echo "⚠️ Nginx/health check failed at $(date -Iseconds)"
+              tail -50 /var/log/nginx/queen_error.log 2>/dev/null || true
             fi
             sleep 30
           done
-
-          echo "❌ Exo queen died"
-          tail -200 logs/exo.log
+          echo "❌ Nginx died"
           exit 1
