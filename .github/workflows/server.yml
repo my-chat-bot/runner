@@ -1,4 +1,4 @@
-name: Exo Swarm
+name: Exo Swarm (Tailscale)
 
 on:
   workflow_dispatch:
@@ -21,6 +21,7 @@ jobs:
       tunnel_url: ${{ steps.tunnel.outputs.url }}
 
     steps:
+      # ── Cache: cloudflared ──
       - uses: actions/cache@v4
         id: cf_cache
         with:
@@ -32,6 +33,16 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
+      # ── Install Tailscale ──
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} --hostname exo-coordinator-${{ github.run_id }}
+          sleep 5
+          echo "✅ Tailscale connected"
+          echo "📡 IP: $(tailscale ip -4)"
+
+      # ── Setup Python and Exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -40,15 +51,16 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
+      # ── Start EXO coordinator ──
       - name: Start EXO coordinator
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
         run: |
           source venv/bin/activate
-          # Run exo – it will auto-discover peers via UDP broadcast
           uv run exo &
           sleep 10
 
+      # ── Start Cloudflare tunnel ──
       - name: Start Cloudflare tunnel
         id: tunnel
         run: |
@@ -65,6 +77,7 @@ jobs:
           echo "::notice::EXO Dashboard: ${TUNNEL_URL}"
           echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
 
+      # ── Self-replication keepalive ──
       - name: Self-replication keepalive
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -75,6 +88,7 @@ jobs:
           while true; do
             ELAPSED=$(( $(date +%s) - START_TIME ))
             if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
+              echo "⏰ Triggering replacement workflow..."
               curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github.v3+json" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/workflows/exo-swarm.yml/dispatches" \
@@ -97,6 +111,16 @@ jobs:
         worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
+      # ── Install Tailscale ──
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} --hostname exo-worker-${{ matrix.worker_id }}-${{ github.run_id }}
+          sleep 5
+          echo "✅ Tailscale connected"
+          echo "📡 IP: $(tailscale ip -4)"
+
+      # ── Setup Python and Exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -105,12 +129,12 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
+      # ── Join EXO cluster ──
       - name: Join EXO cluster
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
         run: |
           source venv/bin/activate
-          # exo auto-discovers other nodes with the same namespace
           uv run exo &
           echo "✅ Worker ${{ matrix.worker_id }} joined cluster"
 
