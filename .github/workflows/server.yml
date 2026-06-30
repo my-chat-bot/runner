@@ -8,6 +8,9 @@ permissions:
   contents: write
 
 jobs:
+  # =====================================================================
+  # QUEEN JOB – Orchestrates everything + serves Open WebUI
+  # =====================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -115,6 +118,7 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
+          # 1. Write the Ollama‑compatible API server (listens on port 8000)
           cat > server.py << 'EOF'
           import subprocess
           import json
@@ -171,18 +175,22 @@ jobs:
           server.serve_forever()
           EOF
 
+          # 2. Start the API server
           python3 server.py &
           sleep 5
 
+          # 3. Install and run Open WebUI
           pip install --quiet open-webui
           export OLLAMA_BASE_URL=http://localhost:8000
           open-webui serve --host 0.0.0.0 --port 3000 &
           sleep 10
 
+          # 4. Cloudflare tunnel to port 3000 (Open WebUI)
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
           ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
 
+          # 5. Extract tunnel URL
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -192,6 +200,7 @@ jobs:
             sleep 2
           done
 
+          # 6. Update config.json in the chat repo
           if [ -n "$TUNNEL_URL" ]; then
             CHAT_REPO="${{ github.repository_owner }}/chat"
             NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
@@ -211,8 +220,13 @@ jobs:
             echo "::notice::Frontend URL: https://$CHAT_REPO"
           fi
 
+          # 7. Keep the runner alive
+          echo "🔄 Queen is serving Open WebUI. Keeping alive..."
           sleep infinity
 
+  # =====================================================================
+  # WORKER JOBS – 10 instances with staggered start + SHA handling
+  # =====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -252,13 +266,14 @@ jobs:
           cd ../..
           chmod +x ggml-rpc-server
 
-      - name: Start RPC server and register
+      - name: Start RPC server and register (with SHA handling)
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
+
           PORT=$((65430 + INSTANCE_ID))
 
           ./ggml-rpc-server -p ${PORT} &
@@ -280,10 +295,29 @@ jobs:
           echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
 
+          # Check if file already exists and get its SHA
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n \
+              --arg msg "register worker $INSTANCE_ID" \
+              --arg content "$ENCODED" \
+              --arg sha "$SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            PAYLOAD=$(jq -n \
+              --arg msg "register worker $INSTANCE_ID" \
+              --arg content "$ENCODED" \
+              '{message: $msg, content: $content}')
+          fi
+
           RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            -d "{\"message\":\"register worker $INSTANCE_ID\",\"content\":\"${ENCODED}\"}" \
-            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
+            -d "$PAYLOAD")
 
           if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
             echo "✅ Worker $INSTANCE_ID registered successfully!"
@@ -293,6 +327,7 @@ jobs:
             exit 1
           fi
 
+          # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
