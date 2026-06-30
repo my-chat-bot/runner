@@ -8,17 +8,34 @@ permissions:
   contents: write   # needed to update config.json
 
 jobs:
-  # -------------------------------------------------------------------
-  # Queen Job – orchestrates everything
-  # -------------------------------------------------------------------
+  # ===================================================================
+  # QUEEN JOB – orchestrates everything
+  # ===================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y jq curl build-essential cmake
+
+      - name: Build llama-cli
+        run: |
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-master
+          mkdir build && cd build
+          cmake .. -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target llama-cli
+          cp bin/llama-cli ../../
+          cd ../..
+          chmod +x llama-cli
+
+      - name: Download model (GGUF)
+        run: |
+          curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
 
       - name: Wait for all workers to register
         env:
@@ -27,7 +44,6 @@ jobs:
         run: |
           echo "👑 Queen waiting for 19 workers to register..."
 
-          # Poll config.json until 19 workers appear
           for i in {1..60}; do
             curl -s -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
@@ -52,16 +68,6 @@ jobs:
           RPC_ADDRS=$(jq -r '.workers | join(",")' /tmp/config.json)
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
 
-      - name: Download llama.cpp
-        run: |
-          curl -Lo llama.cpp.zip https://github.com/ggerganov/llama.cpp/archive/refs/heads/master.zip
-          unzip -j llama.cpp.zip "llama.cpp-master/build/bin/llama-cli" -d .
-          chmod +x llama-cli
-
-      - name: Download model
-        run: |
-          curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
-
       - name: Run distributed inference
         run: |
           echo "🧠 Starting distributed inference with workers: ${RPC_ADDRS}"
@@ -71,31 +77,26 @@ jobs:
             -p "What is the meaning of life?" \
             -n 256
 
-      - name: Start Cloudflare tunnel for Queen (optional – expose API)
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
+      - name: Keep queen alive (optional)
         run: |
-          # If you want to expose a frontend, start an HTTP server
-          # and tunnel it. Here we just keep the runner alive.
           echo "👑 Queen finished inference – keeping alive for 6 hours."
           sleep infinity
 
-  # -------------------------------------------------------------------
-  # Worker Jobs – 19 instances, each runs an RPC server + bore tunnel
-  # -------------------------------------------------------------------
+  # ===================================================================
+  # WORKER JOBS – 19 instances, each runs an RPC server + bore tunnel
+  # ===================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5]
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y jq curl build-essential cmake
 
       - name: Install bore
         run: |
@@ -103,13 +104,19 @@ jobs:
           chmod +x bore
           sudo mv bore /usr/local/bin/
 
-      - name: Download llama.cpp RPC server
+      - name: Build ggml-rpc-server
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggerganov/llama.cpp/archive/refs/heads/master.zip
-          unzip -j llama.cpp.zip "llama.cpp-master/build/bin/llama-rpc-server" -d .
-          chmod +x llama-rpc-server
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-master
+          mkdir build && cd build
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target ggml-rpc-server
+          cp bin/ggml-rpc-server ../../
+          cd ../..
+          chmod +x ggml-rpc-server
 
-      - name: Start llama.cpp RPC server and create bore tunnel
+      - name: Start RPC server and register with bore
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -117,18 +124,17 @@ jobs:
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
 
-          # Start llama.cpp RPC server on a unique port (based on instance)
           PORT=$((65430 + INSTANCE_ID))
-          ./llama-rpc-server --port ${PORT} &
 
-          # Wait for the server to start
+          # Start ggml-rpc-server on the assigned port
+          ./ggml-rpc-server -p ${PORT} &
+
           sleep 5
 
-          # Create bore tunnel
+          # Create bore tunnel to the RPC server port
           bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
           sleep 5
 
-          # Extract the public URL (e.g., bore.pub:12345)
           BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
           if [ -z "$BORE_URL" ]; then
             echo "❌ Failed to get bore URL"
@@ -137,17 +143,14 @@ jobs:
           fi
           echo "✅ Worker $INSTANCE_ID registered at: ${BORE_URL}"
 
-          # ---- Register this worker in config.json ----
-          # Fetch current config
+          # Register in config.json
           curl -s -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
             > /tmp/current.json
 
-          # Append the new URL
           jq --arg url "$BORE_URL" '.workers = (.workers // []) + [$url]' \
             /tmp/current.json > /tmp/updated.json
 
-          # Encode and upload back to GitHub
           CONTENT=$(base64 -w0 /tmp/updated.json)
           SHA=$(jq -r '.sha' /tmp/current.json)
 
@@ -158,15 +161,12 @@ jobs:
 
           echo "✅ Worker $INSTANCE_ID registered successfully!"
 
-          # ---- Keep the worker alive ----
-          echo "🐝 Worker $INSTANCE_ID keeping tunnel and RPC server alive..."
+          # Keep alive
           while true; do
-            # Check if RPC server is still running
-            if ! pgrep -f "llama-rpc-server" > /dev/null; then
+            if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
-              ./llama-rpc-server --port ${PORT} &
+              ./ggml-rpc-server -p ${PORT} &
             fi
-            # Check if bore tunnel is still running
             if ! pgrep -f "bore" > /dev/null; then
               echo "⚠️ Bore tunnel died, restarting..."
               bore local ${PORT} --to bore.pub &
