@@ -8,28 +8,39 @@ permissions:
   contents: write
 
 jobs:
+  # =====================================================================
+  # QUEEN JOB – Orchestrates everything
+  # =====================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake
 
-      - name: Build llama-cli
+      - name: Build llama-cli with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake .. -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
           cmake --build . --config Release -j4 --target llama-cli
           cp bin/llama-cli ../../
           cd ../..
           chmod +x llama-cli
+          # Verify RPC support
+          if ./llama-cli --help 2>&1 | grep -q rpc; then
+            echo "✅ RPC support enabled"
+          else
+            echo "❌ RPC support missing"
+            exit 1
+          fi
 
-      - name: Download model
+      - name: Download model (GGUF)
         run: |
           curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
 
@@ -39,27 +50,34 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           echo "👑 Queen waiting for 5 workers..."
+
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+
             if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
               WORKER_COUNT=0
             else
               WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
               WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
             fi
+
             echo "  Attempt $attempt: $WORKER_COUNT workers registered"
+
             if [ "$WORKER_COUNT" -ge 5 ]; then
               echo "✅ All workers registered!"
               break
             fi
             sleep 5
           done
+
           if [ "$WORKER_COUNT" -lt 5 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
+
+          # Build RPC connection string
           RPC_ADDRS=""
           for file in $WORKER_FILES; do
             curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -72,6 +90,7 @@ jobs:
               RPC_ADDRS="${URL}"
             fi
           done
+
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
 
       - name: Run distributed inference
@@ -86,6 +105,9 @@ jobs:
       - name: Keep queen alive
         run: sleep infinity
 
+  # =====================================================================
+  # WORKER JOBS – 19 instances
+  # =====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -126,14 +148,18 @@ jobs:
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
+
           PORT=$((65430 + INSTANCE_ID))
 
+          # Start RPC server
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
+          # Create bore tunnel
           bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
           sleep 5
 
+          # Extract bore URL
           BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
           if [ -z "$BORE_URL" ]; then
             echo "❌ Failed to get bore URL"
@@ -142,6 +168,7 @@ jobs:
           fi
           echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
 
+          # Write to workers/w<id>.json
           WORKER_FILE="workers/w${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
