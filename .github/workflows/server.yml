@@ -1,390 +1,145 @@
-name: RPC Mesh Server
+name: Hive-Queen
 
 on:
   workflow_dispatch:
-    inputs:
-      model:
-        description: "Hugging Face model path (Ollama style, e.g., glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M)"
-        required: false
-        default: "glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M"
-      shard_count:
-        description: "Number of workers (max 19)"
-        required: false
-        default: "19"
 
 permissions:
   actions: write
-  contents: read
+  contents: write   # needed to update config.json
 
 jobs:
-  # ════════════════════════════════════════════════════════════════════════════════
-  #  COORDINATOR JOB
-  #  Runs on a single GitHub runner. Downloads the model, spawns workers,
-  #  collects their RPC addresses via bore, and launches the main llama-server.
-  # ════════════════════════════════════════════════════════════════════════════════
-  coordinator:
-    name: "🧠 Coordinator"
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    outputs:
-      tunnel_url: ${{ steps.tunnel.outputs.url }}
-
-    steps:
-      # ── Cache cloudflared ──
-      - uses: actions/cache@v4
-        id: cf_cache
-        with:
-          path: ./cloudflared
-          key: cloudflared-v1
-          restore-keys: cloudflared-
-
-      - if: steps.cf_cache.outputs.cache-hit != 'true'
-        run: |
-          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-
-      - if: steps.cf_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ./cloudflared
-          key: cloudflared-v1
-
-      # ── Install Python for rendezvous server ──
-      - name: Setup Python
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y python3-pip python3-venv jq curl
-          python3 -m venv venv
-          source venv/bin/activate
-          pip install flask requests
-
-      # ── Download the model (via Ollama) and locate the GGUF file ──
-      - name: Download model
-        id: model
-        run: |
-          set -e
-          MODEL="${{ github.event.inputs.model }}"
-          echo "📦 Downloading model: $MODEL"
-
-          # Install Ollama temporarily to fetch the GGUF file
-          curl -fsSL https://ollama.com/install.sh | sh
-
-          # Wait for Ollama service to be ready
-          for i in {1..30}; do
-            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-              break
-            fi
-            sleep 2
-          done
-          if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-            echo "❌ Ollama service not ready"
-            exit 1
-          fi
-
-          ollama pull "$MODEL"
-
-          # Locate the actual GGUF file (Ollama stores blobs in a few possible places)
-          MODEL_FILE=$(find /usr/share/ollama/.ollama /home/ollama/.ollama ~/.ollama \
-            -type f \( -name "*.gguf" -o -size +10M \) 2>/dev/null | head -1)
-          if [ -z "$MODEL_FILE" ]; then
-            echo "❌ Could not locate GGUF file"
-            exit 1
-          fi
-          echo "MODEL_FILE=$MODEL_FILE" >> $GITHUB_ENV
-          echo "✅ Model file: $MODEL_FILE ($(du -sh "$MODEL_FILE" | cut -f1))"
-
-      # ── Build llama.cpp with RPC support ──
-      - name: Build llama.cpp (RPC enabled)
-        run: |
-          git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
-          cd llama.cpp
-          mkdir build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CPU=ON
-          cmake --build . --config Release -j $(nproc)
-
-      # ── Upload the model file as an artifact for workers ──
-      - name: Upload model artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: model-file
-          path: ${{ env.MODEL_FILE }}
-          retention-days: 1
-
-      # ── Start the rendezvous server (Flask) ──
-      # This server listens for worker registrations and provides the worker list to the coordinator.
-      - name: Start rendezvous server
-        env:
-          SHARD_COUNT: ${{ github.event.inputs.shard_count }}
-        run: |
-          source venv/bin/activate
-          cat > rendezvous.py << 'EOF'
-          import os, json, time, threading
-          from flask import Flask, request, jsonify
-
-          app = Flask(__name__)
-          workers = {}
-          lock = threading.Lock()
-          EXPECTED = int(os.environ.get("SHARD_COUNT", "19"))
-
-          @app.route("/register", methods=["POST"])
-          def register():
-              data = request.json
-              idx = int(data.get("shard_index", 0))
-              addr = data.get("address", "")
-              with lock:
-                  workers[idx] = addr
-              print(f"✅ Worker {idx} registered: {addr} ({len(workers)}/{EXPECTED})", flush=True)
-              return jsonify({"status": "ok", "registered": len(workers)})
-
-          @app.route("/status", methods=["GET"])
-          def status():
-              with lock:
-                  return jsonify({"registered": len(workers), "expected": EXPECTED, "workers": workers})
-
-          if __name__ == "__main__":
-              app.run(host="0.0.0.0", port=9000, threaded=True)
-          EOF
-          python3 rendezvous.py &
-          RENDEZVOUS_PID=$!
-          echo "✅ Rendezvous server started on port 9000"
-
-          # Store the PID so we can check later
-          echo $RENDEZVOUS_PID > /tmp/rendezvous.pid
-
-      # ── Trigger worker jobs via GitHub API ──
-      - name: Spawn worker jobs
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          SHARD_COUNT: ${{ github.event.inputs.shard_count }}
-        run: |
-          for i in $(seq 0 $((SHARD_COUNT - 1))); do
-            echo "⏳ Triggering worker $i..."
-            curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches" \
-              -d "{
-                \"ref\": \"${{ github.ref }}\",
-                \"inputs\": {
-                  \"model\": \"${{ github.event.inputs.model }}\",
-                  \"shard_index\": \"$i\",
-                  \"shard_count\": \"${{ github.event.inputs.shard_count }}\"
-                }
-              }"
-          done
-
-      # ── Wait for all workers to register (up to 10 minutes) ──
-      - name: Wait for workers
-        run: |
-          for i in {1..60}; do
-            STATUS=$(curl -s http://localhost:9000/status)
-            REGISTERED=$(echo "$STATUS" | jq -r '.registered')
-            EXPECTED=$(echo "$STATUS" | jq -r '.expected')
-            echo "⏳ $REGISTERED/$EXPECTED workers registered"
-            if [ "$REGISTERED" -eq "$EXPECTED" ]; then
-              echo "✅ All workers registered"
-              break
-            fi
-            sleep 10
-          done
-
-      # ── Build the RPC connection string ──
-      - name: Build RPC string
-        id: rpc
-        run: |
-          WORKERS=$(curl -s http://localhost:9000/status | jq -r '.workers | to_entries | map("RPC\(.key)[\(.value)]") | join(",")')
-          echo "rpc_workers=$WORKERS" >> $GITHUB_OUTPUT
-          echo "RPC workers: $WORKERS"
-
-      # ── Start the main llama-server with RPC workers ──
-      - name: Start llama-server
-        run: |
-          cd llama.cpp/build
-          # Use the model file and the RPC workers
-          ./bin/llama-server \
-            --model ${{ env.MODEL_FILE }} \
-            --rpc ${{ steps.rpc.outputs.rpc_workers }} \
-            --port 8000 \
-            --host 0.0.0.0 \
-            --threads 4 \
-            --ctx-size 4096 \
-            --verbose-prompt &
-
-          # Wait for server to start
-          for i in {1..10}; do
-            if curl -s http://localhost:8000/health > /dev/null; then
-              echo "✅ llama-server ready"
-              break
-            fi
-            sleep 2
-          done
-
-      # ── Cloudflare tunnel to expose the API ──
-      - name: Start Cloudflare tunnel
-        id: tunnel
-        run: |
-          ./cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee tunnel.log &
-          for i in {1..30}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "url=$TUNNEL_URL" >> $GITHUB_OUTPUT
-              break
-            fi
-            sleep 2
-          done
-          echo "::notice::Tunnel URL: ${{ steps.tunnel.outputs.url }}"
-
-      # ── Update frontend config.json ──
-      - name: Update frontend config
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
-        run: |
-          CHAT_REPO="${{ github.repository_owner }}/chat"
-          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
-          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha // empty')
-          if [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n --arg m "update API URL" --arg c "$ENCODED" --arg s "$SHA" '{message:$m,content:$c,sha:$s}')
-          else
-            PAYLOAD=$(jq -n --arg m "add API URL" --arg c "$ENCODED" '{message:$m,content:$c}')
-          fi
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-            -d "$PAYLOAD"
-          echo "::notice::Frontend: https://${{ github.repository_owner }}.github.io/chat/"
-
-      # ── Self‑replication keepalive (trigger new run before timeout) ──
-      - name: Self-replication keepalive
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-        run: |
-          START_TIME=$(date +%s)
-          TRIGGER_AT=$((350 * 60))
-          TRIGGERED=false
-
-          while true; do
-            ELAPSED=$(( $(date +%s) - START_TIME ))
-
-            if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
-              echo "⏰ Triggering replacement workflow..."
-              curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rpc-mesh.yml/dispatches" \
-                -d "{
-                  \"ref\":\"${{ github.ref }}\",
-                  \"inputs\":{
-                    \"model\":\"${{ github.event.inputs.model }}\",
-                    \"shard_count\":\"${{ github.event.inputs.shard_count }}\"
-                  }
-                }"
-              TRIGGERED=true
-            fi
-
-            # Health check: keep the server running
-            curl -s http://localhost:8000/health > /dev/null || echo "⚠️ Server unresponsive" >&2
-            sleep 30
-          done
-
-
-  # ════════════════════════════════════════════════════════════════════════════════
-  #  WORKER JOBS (Matrix)
-  #  Each worker downloads the model file, runs llama.cpp rpc-server,
-  #  exposes it via bore, and registers its public address with the coordinator.
-  # ════════════════════════════════════════════════════════════════════════════════
+  # ----- Worker Bees (19 instances) -----
   worker:
-    name: "⚙️ Worker ${{ github.event.inputs.shard_index }}"
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    if: github.event.inputs.shard_index != ''   # only runs when triggered with shard_index
-
+    strategy:
+      matrix:
+        instance: [1, 2, 3, 4, 5]
     steps:
-      # ── Download the model artifact from the coordinator ──
-      - name: Download model artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: model-file
-          path: ./model
-
-      # ── Install dependencies ──
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y curl jq
 
-      # ── Build llama.cpp with RPC support ──
-      - name: Build llama.cpp
+      - name: Download llama.cpp RPC server
         run: |
-          git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
-          cd llama.cpp
-          mkdir build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CPU=ON
-          cmake --build . --config Release -j $(nproc)
+          # Download pre-built llama-server (or build from source)
+          curl -Lo llama-server https://github.com/ggerganov/llama.cpp/releases/download/b4193/llama-server
+          chmod +x llama-server
 
-      # ── Install bore (TCP tunnel) ──
-      - name: Install bore
+      - name: Download bore
         run: |
-          curl -Lo bore https://github.com/ekzhang/bore/releases/latest/download/bore-linux-amd64
+          curl -Lo bore https://github.com/ekzhang/bore/releases/download/v0.5.0/bore
           chmod +x bore
 
-      # ── Start rpc-server and expose it via bore ──
-      - name: Start rpc-server and bore tunnel
+      - name: Start RPC server and bore tunnel
         id: worker
-        run: |
-          set -e
-          SHARD_INDEX="${{ github.event.inputs.shard_index }}"
-          MODEL_FILE=$(find ./model -type f -name "*.gguf" -o -size +10M 2>/dev/null | head -1)
-          if [ -z "$MODEL_FILE" ]; then
-            echo "❌ Model file not found"
-            exit 1
-          fi
-
-          echo "📦 Shard $SHARD_INDEX using model: $MODEL_FILE"
-
-          # Start rpc-server on a port (50052 + SHARD_INDEX)
-          PORT=$((50052 + SHARD_INDEX))
-          cd llama.cpp/build
-          ./bin/rpc-server --host 0.0.0.0 --port $PORT --threads 4 &
-          sleep 5
-
-          # Expose the port using bore (public tunnel)
-          ../bore local $PORT --to bore.pub &
-          sleep 5
-
-          # Get the public address (bore.pub assigns a random subdomain)
-          # We need to extract the actual address. bore prints something like:
-          # "listening on bore.pub:12345" – we can parse that.
-          # However, we can also use a deterministic approach: query the local server
-          # and parse its output, or just assume bore.pub:PORT works (it may not).
-          # Simpler: use the port as the address; the coordinator will connect to bore.pub:PORT.
-          # Note: bore uses a random port, but we can get it from the output.
-          BORE_OUTPUT=$(../bore local $PORT --to bore.pub 2>&1 | head -1)
-          BORE_ADDR=$(echo "$BORE_OUTPUT" | grep -oP 'bore\.pub:\d+' || echo "bore.pub:$PORT")
-          echo "bore_url=$BORE_ADDR" >> $GITHUB_OUTPUT
-          echo "✅ Bore address: $BORE_ADDR"
-
-          # Wait a moment for the tunnel to stabilise
-          sleep 10
-
-      # ── Register with the coordinator ──
-      - name: Register with coordinator
         env:
-          RENDEZVOUS_URL: ${{ secrets.RENDEZVOUS_URL }}   # Must be set by coordinator (or passed as artifact)
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          CHAT_REPO: ${{ github.repository_owner }}/chat
         run: |
-          if [ -z "$RENDEZVOUS_URL" ]; then
-            echo "❌ RENDEZVOUS_URL not set – cannot register"
+          # Start llama.cpp RPC server on port 65432
+          ./llama-server --rpc-server --port 65432 &
+          sleep 2
+
+          # Start bore tunnel
+          ./bore local 65432 --to bore.pub 2>&1 | tee bore.log &
+
+          # Wait for bore to assign a public URL
+          for i in {1..30}; do
+            BORE_URL=$(grep -oP 'bore\.pub:\d+' bore.log | head -1)
+            if [ -n "$BORE_URL" ]; then
+              echo "Bore URL: $BORE_URL"
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$BORE_URL" ]; then
+            echo "Failed to get bore URL"
             exit 1
           fi
-          SHARD_INDEX="${{ github.event.inputs.shard_index }}"
-          BORE_ADDR="${{ steps.worker.outputs.bore_url }}"
-          echo "📝 Registering shard $SHARD_INDEX at $BORE_ADDR"
-          curl -s -X POST "${RENDEZVOUS_URL}/register" \
-            -H "Content-Type: application/json" \
-            -d "{\"shard_index\": ${SHARD_INDEX}, \"address\": \"${BORE_ADDR}\"}"
 
-      # ── Keep the worker alive (the coordinator will trigger the replacement) ──
-      - name: Keepalive
-        run: sleep infinity
+          # Register this worker with config.json (retry on conflict)
+          for attempt in {1..5}; do
+            FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha')
+            CURRENT=$(echo "$FILE_INFO" | jq -r '.content' | base64 -d)
+            if [ -z "$CURRENT" ]; then
+              echo '{"runners":[]}' > current.json
+            else
+              echo "$CURRENT" > current.json
+            fi
+            # Add new URL if not already present
+            jq --arg url "$BORE_URL" '.runners += [$url]' current.json > new.json
+            ENCODED=$(base64 -w0 < new.json)
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+              -d "{\"message\":\"register worker ${{ matrix.instance }}\",\"content\":\"${ENCODED}\",\"sha\":\"${SHA}\"}")
+            if echo "$RESPONSE" | jq -e '.commit' > /dev/null; then
+              echo "Registered worker ${{ matrix.instance }}"
+              break
+            fi
+            sleep 2
+          done
+
+          # Keep the worker alive
+          sleep infinity
+
+  # ----- Queen (1 instance) -----
+  queen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: worker   # optional: starts after workers, but workers run forever; queen will start after worker jobs are all running (they never finish, so we should not use needs; we can remove needs or use it with caution)
+    # Actually, since workers run indefinitely, the queen would never start if we use `needs`. So we should not use needs.
+    # Instead, we let queen run concurrently and poll config.json.
+    # Remove the `needs` line:
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq
+
+      - name: Download llama.cpp CLI
+        run: |
+          curl -Lo llama-cli https://github.com/ggerganov/llama.cpp/releases/download/b4193/llama-cli
+          chmod +x llama-cli
+
+      - name: Download model (e.g., Granite Tiny)
+        run: |
+          # We need a GGUF model file; for demo, download a small one
+          curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
+
+      - name: Queen – discover workers and run inference
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          CHAT_REPO: ${{ github.repository_owner }}/chat
+        run: |
+          # Poll config.json until we have 19 workers
+          MAX_WORKERS=19
+          for i in {1..60}; do
+            FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
+            RUNNERS=$(echo "$FILE_INFO" | jq -r '.content' | base64 -d | jq -r '.runners[]')
+            COUNT=$(echo "$RUNNERS" | grep -c . || true)
+            echo "Found $COUNT workers"
+            if [ "$COUNT" -ge "$MAX_WORKERS" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          # Build the RPC connection string
+          RPC_ARGS=$(echo "$RUNNERS" | sed 's/^/--rpc /' | tr '\n' ',' | sed 's/,$//')
+
+          echo "RPC_ARGS: $RPC_ARGS"
+
+          # Run inference with tensor parallelism across all workers
+          ./llama-cli -m model.gguf $RPC_ARGS -p "What is the capital of France?" -n 100
+
+          # Keep the queen alive (it could also serve as an API endpoint, but for now just runs once)
+          sleep infinity
