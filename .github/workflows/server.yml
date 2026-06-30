@@ -112,17 +112,37 @@ jobs:
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
           echo "RPC_ADDRS=${RPC_ADDRS}"
 
+      # -----------------------------------------------------------------
+      # 🔍 DEBUG: Test llama-cli directly BEFORE starting the API server
+      # -----------------------------------------------------------------
+      - name: Debug llama-cli (manual test)
+        run: |
+          echo "🧪 Testing llama-cli with RPC workers..."
+          echo "RPC_ADDRS: ${RPC_ADDRS}"
+          echo "Running: ./llama-cli -m model.gguf --rpc ${RPC_ADDRS} --tensor-split 10 -p 'Hello' -n 20 --stream"
+          ./llama-cli -m model.gguf \
+            --rpc ${RPC_ADDRS} \
+            --tensor-split 10 \
+            -p "Hello" \
+            -n 20 \
+            --stream 2>&1 | head -100
+          echo "=== Debug test finished ==="
+
+      # -----------------------------------------------------------------
+      # 🚀 Start API server and Cloudflare tunnel
+      # -----------------------------------------------------------------
       - name: Start API server and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          # 1. Write the Ollama‑compatible API server
+          # 1. Write the Ollama‑compatible API server (with stderr capture)
           cat > server.py << 'EOF'
           import subprocess
           import json
           import os
+          import sys
           from http.server import HTTPServer, BaseHTTPRequestHandler
 
           RPC_ADDRS = os.environ.get('RPC_ADDRS', '')
@@ -148,10 +168,13 @@ jobs:
                           prompt = data.get('prompt', '')
                       except:
                           prompt = ''
+
                       self.send_response(200)
                       self.send_header('Content-Type', 'text/event-stream')
                       self.send_header('Cache-Control', 'no-cache')
                       self.end_headers()
+
+                      # Build command
                       cmd = [
                           './llama-cli', '-m', 'model.gguf',
                           '--rpc', RPC_ADDRS,
@@ -160,9 +183,33 @@ jobs:
                           '-n', '256',
                           '--stream'
                       ]
-                      process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                      # Log the command for debugging
+                      sys.stderr.write(f"Running: {' '.join(cmd)}\n")
+                      sys.stderr.flush()
+
+                      # Start process
+                      process = subprocess.Popen(
+                          cmd,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          text=True,
+                          bufsize=1  # line buffered
+                      )
+
+                      # Read stdout line by line
                       for line in process.stdout:
-                          self.wfile.write(f"data: {json.dumps({'response': line.strip()})}\n\n".encode())
+                          if line.strip():
+                              self.wfile.write(f"data: {json.dumps({'response': line.strip()})}\n\n".encode())
+                              self.wfile.flush()
+
+                      # Check for errors
+                      stderr_output = process.stderr.read()
+                      if stderr_output:
+                          sys.stderr.write(f"stderr: {stderr_output}\n")
+                          sys.stderr.flush()
+                          # Optionally send error to client
+                          self.wfile.write(f"data: {json.dumps({'error': stderr_output.strip()})}\n\n".encode())
+
                       self.wfile.write(b"data: [DONE]\n\n")
                   else:
                       self.send_response(404)
@@ -173,7 +220,8 @@ jobs:
 
           if __name__ == '__main__':
               server = HTTPServer(('0.0.0.0', 8000), OllamaHandler)
-              print("✅ Ollama-compatible API server running on port 8000")
+              sys.stderr.write("✅ Ollama-compatible API server running on port 8000\n")
+              sys.stderr.flush()
               server.serve_forever()
           EOF
 
@@ -244,7 +292,7 @@ jobs:
           sleep infinity
 
   # =====================================================================
-  # WORKER JOBS – 10 instances with staggered start + retry on conflict
+  # WORKER JOBS – 10 instances with staggered start + retry on 409
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
@@ -318,13 +366,11 @@ jobs:
           for attempt in {1..10}; do
             echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
 
-            # Get current file info (if it exists)
             FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
             SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
 
-            # Build payload
             if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
               PAYLOAD=$(jq -n \
                 --arg msg "register worker $INSTANCE_ID" \
@@ -343,13 +389,11 @@ jobs:
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
               -d "$PAYLOAD")
 
-            # Check for success
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
               echo "✅ Worker $INSTANCE_ID registered successfully!"
               break
             fi
 
-            # Check for 409 conflict
             STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
             if [ "$STATUS" = "409" ]; then
               echo "⚠️ Conflict detected (409) – retrying in 3 seconds..."
@@ -357,15 +401,13 @@ jobs:
               continue
             fi
 
-            # Other errors – fail immediately
             echo "❌ Failed to register worker $INSTANCE_ID"
             echo "Response: $RESPONSE"
             exit 1
           done
 
-          # If we exhausted retries
           if [ "$attempt" -ge 10 ]; then
-            echo "❌ Worker $INSTANCE_ID failed to register after 10 attempts"
+            echo "❌ Worker $INSTANCE_ID failed after 10 attempts"
             exit 1
           fi
 
