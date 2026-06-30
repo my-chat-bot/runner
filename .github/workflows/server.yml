@@ -33,30 +33,37 @@ jobs:
         run: |
           curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
 
-      - name: Wait for workers to register
+      - name: Wait for workers and collect URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.repository }}
         run: |
           echo "👑 Queen waiting for 19 workers..."
-          for i in {1..60}; do
-            curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
-              > /tmp/config.json
-            WORKER_COUNT=$(jq '.workers | length' /tmp/config.json 2>/dev/null || echo 0)
-            echo "  Attempt $i: $WORKER_COUNT workers registered"
+          for attempt in {1..60}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/workers.json")
+            if [ "$(echo "$RESPONSE" | jq -r '.sha')" = "null" ]; then
+              echo "  workers.json not yet created"
+              sleep 5
+              continue
+            fi
+            CONTENT_JSON=$(echo "$RESPONSE" | jq -r '.content' | base64 -d)
+            WORKER_COUNT=$(echo "$CONTENT_JSON" | jq '.workers | length')
+            echo "  Attempt $attempt: $WORKER_COUNT workers registered"
             if [ "$WORKER_COUNT" -ge 19 ]; then
               echo "✅ All workers registered!"
+              RPC_ADDRS=$(echo "$CONTENT_JSON" | jq -r '.workers | join(",")')
+              echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
               break
             fi
-            sleep 10
+            sleep 5
           done
-          if [ "$WORKER_COUNT" -lt 19 ]; then
+          if [ -z "$RPC_ADDRS" ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
-          RPC_ADDRS=$(jq -r '.workers | join(",")' /tmp/config.json)
-          echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
 
       - name: Run distributed inference
         run: |
@@ -75,7 +82,7 @@ jobs:
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5]
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
       - name: Install dependencies
@@ -107,6 +114,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.repository }}
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
@@ -124,25 +132,51 @@ jobs:
             cat /tmp/bore_url.txt
             exit 1
           fi
-          echo "✅ Worker $INSTANCE_ID registered at: ${BORE_URL}"
+          echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
 
-          curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
-            > /tmp/current.json
+          # ---------- Register in workers.json with retry ----------
+          for attempt in {1..30}; do
+            echo "Attempt $attempt: Registering worker $INSTANCE_ID"
 
-          jq --arg url "$BORE_URL" '.workers = (.workers // []) + [$url]' \
-            /tmp/current.json > /tmp/updated.json
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/workers.json")
 
-          CONTENT=$(base64 -w0 /tmp/updated.json)
-          SHA=$(jq -r '.sha' /tmp/current.json)
+            SHA=$(echo "$RESPONSE" | jq -r '.sha // ""')
+            if [ "$SHA" = "null" ] || [ -z "$SHA" ]; then
+              CONTENT_JSON='{"workers": []}'
+              SHA=""
+            else
+              CONTENT_JSON=$(echo "$RESPONSE" | jq -r '.content' | base64 -d)
+            fi
 
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
-            -d "{\"message\":\"register worker $INSTANCE_ID\",\"content\":\"${CONTENT}\",\"sha\":\"${SHA}\"}"
+            UPDATED_JSON=$(echo "$CONTENT_JSON" | jq --arg url "$BORE_URL" '.workers += [$url]')
+            ENCODED=$(echo "$UPDATED_JSON" | base64 -w0)
 
-          echo "✅ Worker $INSTANCE_ID registered successfully!"
+            if [ -z "$SHA" ]; then
+              PAYLOAD=$(jq -n --arg msg "register worker $INSTANCE_ID" --arg content "$ENCODED" \
+                '{message: $msg, content: $content}')
+            else
+              PAYLOAD=$(jq -n --arg msg "register worker $INSTANCE_ID" --arg content "$ENCODED" --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            fi
 
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/workers.json" \
+              -d "$PAYLOAD")
+
+            if echo "$RESPONSE" | jq -e '.message | contains("409")' > /dev/null; then
+              echo "Conflict detected – retrying in 2 seconds..."
+              sleep 2
+              continue
+            fi
+
+            echo "✅ Worker $INSTANCE_ID registered successfully!"
+            break
+          done
+
+          # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
