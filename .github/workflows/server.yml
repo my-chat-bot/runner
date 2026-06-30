@@ -13,9 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  # ════════════════════════════════════════════════════════════
-  #  JOB 0 – COORDINATOR (Tailscale node + Exo orchestrator)
-  # ════════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  #  COORDINATOR (long‑running – does NOT finish)
+  # ─────────────────────────────────────────────────────────────
   coordinator:
     name: "🧠 Coordinator"
     runs-on: ubuntu-latest
@@ -24,13 +24,11 @@ jobs:
       tunnel_url: ${{ steps.tunnel.outputs.url }}
 
     steps:
-      # ── 1. Install uv (required for exo) ──
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           version: "latest"
 
-      # ── 2. Cache cloudflared ──
       - uses: actions/cache@v4
         id: cf_cache
         with:
@@ -42,7 +40,6 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ── 3. Install Tailscale ──
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -52,7 +49,6 @@ jobs:
           echo "✅ Tailscale connected"
           echo "📡 IP: $(tailscale ip -4)"
 
-      # ── 4. Setup Python and install exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -61,7 +57,6 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
-      # ── 5. Start EXO coordinator ──
       - name: Start EXO coordinator
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
@@ -70,7 +65,6 @@ jobs:
           uv run exo &
           sleep 10
 
-      # ── 6. Start Cloudflare tunnel → Exo dashboard ──
       - name: Start Cloudflare tunnel
         id: tunnel
         run: |
@@ -87,7 +81,6 @@ jobs:
           echo "::notice::EXO Dashboard: ${TUNNEL_URL}"
           echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
 
-      # ── 7. Self‑replication keepalive ──
       - name: Self-replication keepalive
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -108,7 +101,6 @@ jobs:
               TRIGGERED=true
             fi
 
-            # Health checks
             pgrep -f exo > /dev/null || (source venv/bin/activate && uv run exo &)
             pgrep -f cloudflared > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
             sudo tailscale status > /dev/null || sudo tailscale up --auth-key ${{ secrets.TAILSCALE_AUTHKEY }} \
@@ -117,28 +109,25 @@ jobs:
             sleep 30
           done
 
-
-  # ════════════════════════════════════════════════════════════
-  #  JOBS 1–19 – EXO WORKER NODES (Tailscale + Exo worker)
-  # ════════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  #  WORKERS (start in parallel – do NOT depend on coordinator)
+  # ─────────────────────────────────────────────────────────────
   worker:
     name: "⚙️ Worker ${{ matrix.worker_id }}"
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    needs: coordinator
+    # ❌ REMOVED: needs: coordinator
     strategy:
       fail-fast: false
       matrix:
         worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
-      # ── 1. Install uv ──
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           version: "latest"
 
-      # ── 2. Install Tailscale ──
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -148,7 +137,6 @@ jobs:
           echo "✅ Tailscale connected"
           echo "📡 IP: $(tailscale ip -4)"
 
-      # ── 3. Setup Python and install exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -157,7 +145,6 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
-      # ── 4. Join EXO cluster ──
       - name: Join EXO cluster
         env:
           EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
