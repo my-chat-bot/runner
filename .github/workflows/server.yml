@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   # ════════════════════════════════════════════════════════════
-  #  JOB 0 – COORDINATOR (Rendezvous + Discovery Server)
+  #  JOB 0 – COORDINATOR (First Exo node)
   # ════════════════════════════════════════════════════════════
   coordinator:
     name: "🧠 Coordinator"
@@ -36,71 +36,25 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ── Install Python, Flask, Exo, and requests ──
-      - name: Setup Python environment
+      # ── Install Exo ──
+      - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-pip python3-venv
           python3 -m venv venv
           source venv/bin/activate
-          pip install --quiet flask exo requests
+          pip install --quiet exo
 
-      # ── Rendezvous server (Flask) ──
-      - name: Start rendezvous server
+      # ── Start EXO coordinator ──
+      - name: Start EXO coordinator
         run: |
           source venv/bin/activate
-          cat > rendezvous.py << 'PYEOF'
-          import json, threading, time, os
-          from flask import Flask, request, jsonify
+          # Start exo with a node ID – this enables UDP broadcast discovery
+          exo --node-id coordinator &
+          sleep 5
 
-          app = Flask(__name__)
-          lock = threading.Lock()
-          workers = {}  # worker_id → {"url": tunnel_url, "registered_at": timestamp}
-
-          @app.route("/register", methods=["POST"])
-          def register():
-              data = request.json
-              worker_id = data.get("id")
-              url = data.get("url")
-              if not worker_id or not url:
-                  return jsonify({"error": "missing id or url"}), 400
-              with lock:
-                  workers[worker_id] = {"url": url, "registered_at": time.time()}
-              print(f"✅ Registered {worker_id} ({len(workers)} workers)", flush=True)
-              return jsonify({"status": "ok", "total": len(workers)})
-
-          @app.route("/discovery.json", methods=["GET"])
-          def discovery():
-              # Build EXO-compatible discovery config
-              with lock:
-                  nodes = [{"id": "coordinator", "address": os.environ.get("COORDINATOR_URL", ""), "port": 52415}]
-                  for wid, info in workers.items():
-                      nodes.append({"id": wid, "address": info["url"], "port": 52415})
-              config = {"nodes": nodes}
-              return jsonify(config)
-
-          @app.route("/status", methods=["GET"])
-          def status():
-              with lock:
-                  return jsonify({
-                      "workers": len(workers),
-                      "expected": int(os.environ.get("EXPECTED_WORKERS", "19")),
-                      "ready": len(workers) >= int(os.environ.get("EXPECTED_WORKERS", "19")),
-                      "list": list(workers.keys())
-                  })
-
-          if __name__ == "__main__":
-              print("🔀 Rendezvous server starting on :9000", flush=True)
-              app.run(host="0.0.0.0", port=9000, threaded=True)
-          PYEOF
-
-          export EXPECTED_WORKERS=19
-          export COORDINATOR_URL="pending"  # will be updated after tunnel
-          python3 rendezvous.py &
-          sleep 2
-
-      # ── Start Cloudflare tunnels ──
-      - name: Start Cloudflare tunnels
+      # ── Start Cloudflare tunnel to Exo dashboard ──
+      - name: Start Cloudflare tunnel
         id: tunnel
         run: |
           if [ ! -f ./cloudflared ]; then
@@ -108,98 +62,14 @@ jobs:
             chmod +x cloudflared
           fi
 
-          # Tunnel for the rendezvous server (port 9000)
-          ./cloudflared tunnel --protocol http2 --url http://localhost:9000 2>&1 | tee rendezvous_tunnel.log &
-
-          # Tunnel for EXO dashboard (port 52415)
-          ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee exo_tunnel.log &
-
-          # Extract rendezvous URL (for workers to register)
+          ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee tunnel.log &
           for i in {1..30}; do
-            RENDEZVOUS_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' rendezvous_tunnel.log | head -1)
-            [ -n "$RENDEZVOUS_URL" ] && break
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            [ -n "$TUNNEL_URL" ] && break
             sleep 2
           done
-
-          # Extract EXO dashboard URL (for user access)
-          for i in {1..30}; do
-            EXO_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' exo_tunnel.log | head -1)
-            [ -n "$EXO_URL" ] && break
-            sleep 2
-          done
-
-          echo "RENDEZVOUS_URL=$RENDEZVOUS_URL" >> $GITHUB_ENV
-          echo "EXO_URL=$EXO_URL" >> $GITHUB_ENV
-          echo "url=$EXO_URL" >> "$GITHUB_OUTPUT"
-          echo "::notice::Rendezvous URL: ${RENDEZVOUS_URL}"
-          echo "::notice::EXO Dashboard: ${EXO_URL}"
-
-          # Write rendezvous URL to a file for artifact
-          echo "$RENDEZVOUS_URL" > rendezvous_url.txt
-
-      - name: Upload rendezvous URL artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rendezvous-url
-          path: rendezvous_url.txt
-          retention-days: 1
-
-      # ── Start EXO coordinator (with manual discovery) ──
-      - name: Start EXO coordinator
-        run: |
-          source venv/bin/activate
-
-          # Write a minimal discovery config that points to the rendezvous /discovery.json
-          cat > discovery.json << EOF
-          {
-            "nodes": [
-              {"id": "coordinator", "address": "${RENDEZVOUS_URL}", "port": 52415}
-            ]
-          }
-          EOF
-
-          # Simple wrapper: fetch discovery.json periodically and restart EXO if needed
-          cat > exo_wrapper.py << 'PYEOF'
-          import subprocess, time, json, requests, os, sys, signal
-
-          RENDEZVOUS_URL = os.environ.get("RENDEZVOUS_URL")
-          if not RENDEZVOUS_URL:
-              print("❌ RENDEZVOUS_URL not set")
-              sys.exit(1)
-
-          def fetch_config():
-              try:
-                  resp = requests.get(f"{RENDEZVOUS_URL}/discovery.json", timeout=5)
-                  if resp.status_code == 200:
-                      with open("/tmp/discovery.json", "w") as f:
-                          f.write(resp.text)
-                      return True
-              except Exception as e:
-                  print(f"⚠️ Failed to fetch discovery config: {e}")
-              return False
-
-          # Fetch initial config
-          fetch_config()
-
-          # Start EXO with manual discovery
-          cmd = ["exo", "--discovery-module", "manual",
-                 "--discovery-config-path", "/tmp/discovery.json"]
-          proc = subprocess.Popen(cmd)
-
-          # Periodically refresh config (EXO may not pick up changes, but we'll keep it)
-          try:
-              while True:
-                  time.sleep(60)
-                  fetch_config()
-          except KeyboardInterrupt:
-              proc.terminate()
-          PYEOF
-
-          export RENDEZVOUS_URL="${RENDEZVOUS_URL}"
-          python3 exo_wrapper.py &
-          EXO_PID=$!
-
-          sleep 10
+          echo "::notice::EXO Dashboard: ${TUNNEL_URL}"
+          echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
 
       # ── Self-replication keepalive ──
       - name: Self-replication keepalive
@@ -223,9 +93,8 @@ jobs:
             fi
 
             # Health checks
-            curl -s http://localhost:9000/status > /dev/null || (source venv/bin/activate && python3 rendezvous.py &)
-            pgrep -f exo > /dev/null || (source venv/bin/activate && python3 exo_wrapper.py &)
-            pgrep -f cloudflared > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a exo_tunnel.log &
+            pgrep -f exo > /dev/null || (source venv/bin/activate && exo --node-id coordinator &)
+            pgrep -f cloudflared > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
 
             sleep 30
           done
@@ -233,6 +102,7 @@ jobs:
 
   # ════════════════════════════════════════════════════════════
   #  JOBS 1–19 – EXO WORKER NODES
+  #  Each worker joins the cluster via UDP broadcast
   # ════════════════════════════════════════════════════════════
   worker:
     name: "⚙️ Worker ${{ matrix.worker_id }}"
@@ -245,116 +115,27 @@ jobs:
         worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
-      # ── Cache: cloudflared ──
-      - uses: actions/cache@v4
-        id: cf_cache
-        with:
-          path: ./cloudflared
-          key: cloudflared-v1
-
-      - if: steps.cf_cache.outputs.cache-hit != 'true'
-        run: |
-          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-
-      # ── Install Python, Exo, and requests ──
-      - name: Setup Python environment
+      # ── Install Exo ──
+      - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-pip python3-venv
           python3 -m venv venv
           source venv/bin/activate
-          pip install --quiet exo requests
+          pip install --quiet exo
 
-      # ── Get coordinator rendezvous URL via artifact ──
-      - name: Retrieve rendezvous URL
-        id: get_rendezvous
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          REPO="${{ github.repository }}"
-          for i in {1..20}; do
-            ARTIFACT_ID=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
-              | jq -r '.artifacts[] | select(.name=="rendezvous-url") | .id' | head -1)
-            if [ -n "$ARTIFACT_ID" ]; then
-              curl -sL -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip" \
-                -o rendezvous.zip
-              unzip -q rendezvous.zip
-              RENDEZVOUS_URL=$(cat rendezvous_url.txt)
-              echo "RENDEZVOUS_URL=$RENDEZVOUS_URL" >> $GITHUB_ENV
-              echo "✅ Retrieved rendezvous URL: $RENDEZVOUS_URL"
-              break
-            fi
-            echo "⏳ Waiting for coordinator artifact (attempt $i/20)..."
-            sleep 10
-          done
-          if [ -z "$RENDEZVOUS_URL" ]; then
-            echo "❌ Failed to retrieve rendezvous URL"
-            exit 1
-          fi
-
-      # ── Get worker tunnel URL ──
-      - name: Start worker tunnel
-        id: tunnel
-        run: |
-          if [ ! -f ./cloudflared ]; then
-            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x cloudflared
-          fi
-          ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee worker_tunnel.log &
-          for i in {1..30}; do
-            WORKER_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' worker_tunnel.log | head -1)
-            [ -n "$WORKER_URL" ] && break
-            sleep 2
-          done
-          echo "WORKER_URL=$WORKER_URL" >> $GITHUB_ENV
-          echo "::notice::Worker ${{ matrix.worker_id }} URL: $WORKER_URL"
-
-      # ── Register with coordinator ──
-      - name: Register worker
-        run: |
-          WORKER_ID="worker-${{ matrix.worker_id }}"
-          echo "📝 Registering $WORKER_ID with coordinator..."
-          for attempt in {1..10}; do
-            RESPONSE=$(curl -s -X POST "${RENDEZVOUS_URL}/register" \
-              -H "Content-Type: application/json" \
-              -d "{\"id\": \"$WORKER_ID\", \"url\": \"$WORKER_URL\"}")
-            if echo "$RESPONSE" | grep -q '"status":"ok"'; then
-              echo "✅ Registered successfully"
-              break
-            fi
-            echo "⏳ Attempt $attempt/10 failed, retrying in 5s..."
-            sleep 5
-          done
-
-      # ── Start EXO worker with manual discovery ──
-      - name: Start EXO worker
+      # ── Join EXO cluster ──
+      - name: Join EXO cluster
         run: |
           source venv/bin/activate
+          # exo automatically discovers other nodes via UDP broadcast
+          # All runners in the same Azure region can see each other
+          exo --node-id worker-${{ matrix.worker_id }} &
+          echo "✅ Worker ${{ matrix.worker_id }} joined cluster"
 
-          # Fetch the discovery config from coordinator
-          curl -s "${RENDEZVOUS_URL}/discovery.json" -o /tmp/discovery.json
-
-          # Start EXO with manual discovery
-          exo --discovery-module manual \
-              --discovery-config-path /tmp/discovery.json &
-          EXO_PID=$!
-
-          # Keep alive loop with periodic config refresh
           while true; do
-            # Refresh discovery config every 60 seconds
-            curl -s "${RENDEZVOUS_URL}/discovery.json" -o /tmp/discovery.json.new
-            mv /tmp/discovery.json.new /tmp/discovery.json
-
             if ! pgrep -f exo > /dev/null; then
-              exo --discovery-module manual \
-                  --discovery-config-path /tmp/discovery.json &
+              exo --node-id worker-${{ matrix.worker_id }} &
             fi
-
-            sleep 60
+            sleep 30
           done
