@@ -140,35 +140,38 @@ jobs:
             exit 1
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
+          echo "HOLESAIL_URLS=${HOLESAIL_URLS}"
 
-      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
-      - name: Connect to workers via Holesail (unique ports)
+      # ---------- NOVEL: Dockerized Holesail Clients ----------
+      - name: Connect to workers via Dockerized Holesail
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
-          echo "🔗 Connecting to workers via Holesail P2P tunnels..."
+          echo "🔗 Connecting to workers via Dockerized Holesail P2P tunnels..."
+
+          # Clean up any old containers
+          docker rm -f $(docker ps -aq) 2>/dev/null || true
 
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
-          LOCAL_PORT=60000
-          RPC_ADDRS=""
-
-          for url in "${URLS[@]}"; do
-            echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
-            # Use --port to force client to listen on a specific local port
-            holesail "${url}" --port ${LOCAL_PORT} &
-
-            if [ -n "$RPC_ADDRS" ]; then
-              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
-            else
-              RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
-            fi
-
-            LOCAL_PORT=$((LOCAL_PORT + 1))
+          HOST_PORT=60000
+          CONTAINER_PORTS=""
+          for i in "${!URLS[@]}"; do
+            URL="${URLS[$i]}"
+            CONTAINER_NAME="holesail-$i"
+            echo "Starting Docker container for worker $i with URL: ${URL}"
+            # Run holesail client inside container, mapping host port to container port 50052
+            docker run -d --rm --name ${CONTAINER_NAME} -p ${HOST_PORT}:50052 node:22-alpine \
+              sh -c "npm install -g holesail && holesail '${URL}'" || true
+            CONTAINER_PORTS="${CONTAINER_PORTS},127.0.0.1:${HOST_PORT}"
+            HOST_PORT=$((HOST_PORT + 1))
+            sleep 2
           done
 
+          # Remove leading comma
+          RPC_ADDRS=${CONTAINER_PORTS:1}
           echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
-          echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
-          sleep 10   # give tunnels time to establish
+          echo "✅ Dockerized Holesail tunnels established. RPC: ${RPC_ADDRS}"
+          sleep 10
 
       - name: Start llama-server with RPC and Cloudflare tunnel
         env:
@@ -223,6 +226,7 @@ jobs:
             exit 1
           fi
 
+          # Update config.json with tunnel URL
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -239,6 +243,8 @@ jobs:
               -d "$PAYLOAD"
           fi
           echo "::notice::Frontend URL: https://$CHAT_REPO"
+
+          # Keep alive
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
