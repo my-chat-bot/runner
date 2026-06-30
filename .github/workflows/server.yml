@@ -11,103 +11,105 @@ jobs:
   # =====================================================================
   # QUEEN JOB – Orchestrates everything
   # =====================================================================
-        queen:
-        runs-on: ubuntu-latest
-        timeout-minutes: 360
-      
-        steps:
-          - name: Install dependencies
-            run: |
-              sudo apt-get update -qq
-              sudo apt-get install -y jq curl build-essential cmake
-      
-          - name: Build llama-cli with RPC support
-            run: |
-              curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
-              unzip -q llama.cpp.zip
-              cd llama.cpp-master
-              mkdir build && cd build
-              cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-              cmake --build . --config Release -j4 --target llama-cli
-              cp bin/llama-cli ../../
-              cd ../..
-              chmod +x llama-cli
-              # Verify RPC support
-              if ./llama-cli --help 2>&1 | grep -q rpc; then
-                echo "✅ RPC support enabled"
-              else
-                echo "❌ RPC support missing"
-                exit 1
-              fi
-      
-          - name: Download model (GGUF)
-            run: |
-              MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
-              echo "📦 Downloading model from: $MODEL_URL"
-              curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
-              if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
-                echo "✅ Valid GGUF file downloaded"
-                ls -lh model.gguf
-              else
-                echo "❌ Invalid GGUF file – first 4 bytes: $(head -c 4 model.gguf)"
-                exit 1
-              fi
-      
-          - name: Wait for workers and collect URLs
-            env:
-              GH_TOKEN: ${{ secrets.TOKEN }}
-              REPO: ${{ github.repository }}
-            run: |
-              echo "👑 Queen waiting for 5 workers..."
-              for attempt in {1..60}; do
-                RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                  -H "Accept: application/vnd.github+json" \
-                  "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-                if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
-                  WORKER_COUNT=0
-                else
-                  WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
-                  WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
-                fi
-                echo "  Attempt $attempt: $WORKER_COUNT workers registered"
-                if [ "$WORKER_COUNT" -ge 5 ]; then
-                  echo "✅ All workers registered!"
-                  break
-                fi
-                sleep 5
-              done
-              if [ "$WORKER_COUNT" -lt 5 ]; then
-                echo "❌ Timeout waiting for workers"
-                exit 1
-              fi
-              RPC_ADDRS=""
-              for file in $WORKER_FILES; do
-                curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                  "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
-                  > /tmp/worker.json
-                URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
-                if [ -n "$RPC_ADDRS" ]; then
-                  RPC_ADDRS="${RPC_ADDRS},${URL}"
-                else
-                  RPC_ADDRS="${URL}"
-                fi
-              done
-              echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
-      
-          - name: Run distributed inference
-            run: |
-              echo "🧠 Distributed inference with workers: ${RPC_ADDRS}"
-              ./llama-cli -m model.gguf \
-                --rpc ${RPC_ADDRS} \
-                --tensor-split 5 \
-                -p "What is the meaning of life?" \
-                -n 256
-      
-          - name: Keep queen alive
-            run: sleep infinity
-      
+  queen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq curl build-essential cmake
+
+      - name: Build llama-cli with RPC support
+        run: |
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
+          unzip -q llama.cpp.zip
+          cd llama.cpp-master
+          mkdir build && cd build
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target llama-cli
+          cp bin/llama-cli ../../
+          cd ../..
+          chmod +x llama-cli
+          # Verify RPC support
+          if ./llama-cli --help 2>&1 | grep -q rpc; then
+            echo "✅ RPC support enabled"
+          else
+            echo "❌ RPC support missing"
+            exit 1
+          fi
+
+      - name: Download model (GGUF)
+        run: |
+          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
+          echo "📦 Downloading model from: $MODEL_URL"
+          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
+          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
+            echo "✅ Valid GGUF file downloaded"
+            ls -lh model.gguf
+          else
+            echo "❌ Invalid GGUF file – first 4 bytes: $(head -c 4 model.gguf)"
+            echo "File content (first 200 bytes):"
+            head -c 200 model.gguf
+            exit 1
+          fi
+
+      - name: Wait for workers and collect URLs
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "👑 Queen waiting for 5 workers..."
+          for attempt in {1..60}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
+              WORKER_COUNT=0
+            else
+              WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
+              WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
+            fi
+            echo "  Attempt $attempt: $WORKER_COUNT workers registered"
+            if [ "$WORKER_COUNT" -ge 5 ]; then
+              echo "✅ All workers registered!"
+              break
+            fi
+            sleep 5
+          done
+          if [ "$WORKER_COUNT" -lt 5 ]; then
+            echo "❌ Timeout waiting for workers"
+            exit 1
+          fi
+          RPC_ADDRS=""
+          for file in $WORKER_FILES; do
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
+              > /tmp/worker.json
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            if [ -n "$RPC_ADDRS" ]; then
+              RPC_ADDRS="${RPC_ADDRS},${URL}"
+            else
+              RPC_ADDRS="${URL}"
+            fi
+          done
+          echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
+
+      - name: Run distributed inference
+        run: |
+          echo "🧠 Distributed inference with workers: ${RPC_ADDRS}"
+          ./llama-cli -m model.gguf \
+            --rpc ${RPC_ADDRS} \
+            --tensor-split 5 \
+            -p "What is the meaning of life?" \
+            -n 256
+
+      - name: Keep queen alive
+        run: sleep infinity
+
   # =====================================================================
-  # WORKER JOBS – 19 instances
+  # WORKER JOBS – 5 instances (change to 19 for full deployment)
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
