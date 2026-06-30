@@ -95,15 +95,32 @@ jobs:
         run: |
           set -e
 
-          # Install Ollama transiently — only needed to pull the model file for splitting
-          # It is NOT started as a server; we never run inference here
+          # Install Ollama transiently — only to download the model blob for splitting.
+          # The install script starts Ollama as a systemd service (ollama user).
+          # We MUST wait for the API to be reachable before issuing pull.
           curl -fsSL https://ollama.com/install.sh | sh
+
+          echo "⏳ Waiting for Ollama systemd service to be ready..."
+          for i in {1..30}; do
+            curl -s http://localhost:11434/api/tags > /dev/null 2>&1 && echo "✅ Ollama API ready" && break
+            sleep 2
+          done
+          if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+            echo "❌ Ollama service never became ready — dumping diagnostics"
+            systemctl status ollama || true
+            journalctl -u ollama --no-pager -n 30 || true
+            exit 1
+          fi
+
           ollama pull "$MODEL"
 
-          MODEL_FILE=$(find ~/.ollama/models -type f \( -name "*.gguf" -o -size +10M \) | head -1)
+          # Systemd service runs as the 'ollama' user → blobs land in /usr/share/ollama/.ollama
+          # or /home/ollama/.ollama — search both, then runner's ~/.ollama as fallback
+          MODEL_FILE=$(find /usr/share/ollama/.ollama /home/ollama/.ollama ~/.ollama \
+            -type f \( -name "*.gguf" -o -size +10M \) 2>/dev/null | head -1)
           if [ -z "$MODEL_FILE" ]; then
             echo "❌ Could not locate model blob after pull"
-            find ~/.ollama -type f | head -20
+            find /usr/share/ollama/.ollama /home/ollama/.ollama ~/.ollama -type f 2>/dev/null | head -20
             exit 1
           fi
 
@@ -130,10 +147,11 @@ jobs:
           print(json.dumps(manifest, indent=2))
           PYEOF
 
-          # Purge Ollama + model — coordinator must NOT run inference
-          pkill -f ollama 2>/dev/null || true
-          rm -rf ~/.ollama
-          echo "🗑️  Ollama purged from coordinator — inference lives in workers only"
+          # Stop service + purge all model blobs — coordinator must NOT run inference
+          sudo systemctl stop ollama 2>/dev/null || true
+          sudo systemctl disable ollama 2>/dev/null || true
+          sudo rm -rf /usr/share/ollama/.ollama /home/ollama/.ollama ~/.ollama
+          echo "🗑️  Ollama stopped + purged — inference lives in workers only"
 
       - name: Upload shard bundle
         uses: actions/upload-artifact@v4
