@@ -66,7 +66,7 @@ jobs:
 
       - name: Build llama-server with RPC support
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/releases/download/b9859/llama-b9859-bin-ubuntu-x64.tar.gz
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
@@ -181,8 +181,6 @@ jobs:
           nohup ./llama-server \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
-                --device RPC0,RPC1,RPC2,RPC3,RPC4 \
-                --tensor-split 1,1,1,1,1 \
                 --numa distribute \
                 -fa on \
                 -ngl 0 \
@@ -266,7 +264,7 @@ jobs:
 
       - name: Build ggml-rpc-server
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/releases/download/b9859/llama-b9859-bin-ubuntu-x64.tar.gz
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
