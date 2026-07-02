@@ -181,8 +181,8 @@ jobs:
           nohup ./llama-server \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
-                --numa distribute
-                --no-mmap
+                --numa distribute \
+                --no-mmap \
                 -fa on \
                 -ngl 0 \
                 -c 4096 \
